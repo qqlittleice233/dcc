@@ -23,6 +23,7 @@ SIGNJAR = 'tools/signapk.jar'
 NDKBUILD = 'ndk-build'
 LIBNATIVECODE = 'libnc.so'
 
+show_logging(level=logging.INFO)
 logger = logging.getLogger('dcc')
 
 tempfiles = []
@@ -87,14 +88,17 @@ def build_project(project_dir, num_processes=0):
     subprocess.check_call([NDKBUILD, '-j%d' % cpu_count(), '-C', project_dir])
 
 
-def auto_vm(filename):
+def auto_vms(filename):
     ret = androconf.is_android(filename)
     if ret == 'APK':
-        return dvm.DalvikVMFormat(apk.APK(filename).get_dex())
+        vms = []
+        for dex in apk.APK(filename).get_all_dex():
+            vms.append(dvm.DalvikVMFormat(dex))
+        return vms
     elif ret == 'DEX':
-        return dvm.DalvikVMFormat(read(filename))
+        return [dvm.DalvikVMFormat(read(filename))]
     elif ret == 'DEY':
-        return dvm.DalvikOdexVMFormat(read(filename))
+        return [dvm.DalvikOdexVMFormat(read(filename))]
     raise Exception("unsupported file %s" % filename)
 
 
@@ -339,21 +343,17 @@ def archive_compiled_code(project_dir):
     outfile = shutil.make_archive(outfile, 'zip', project_dir)
     return outfile
 
-def compile_dex(apkfile, filtercfg, dynamic_register):
-    show_logging(level=logging.INFO)
 
-    d = auto_vm(apkfile)
-    dx = analysis.Analysis(d)
-
-    method_filter = MethodFilter(filtercfg, d)
-
-    compiler = Dex2C(d, dx, dynamic_register)
+def compile_dex(vm, filtercfg, dynamic_register):
+    vmx = analysis.Analysis(vm)
+    method_filter = MethodFilter(filtercfg, vm)
+    compiler = Dex2C(vm, vmx, dynamic_register)
 
     native_method_prototype = {}
     compiled_method_code = {}
     errors = []
 
-    for m in d.get_methods():
+    for m in vm.get_methods():
         method_triple = get_method_triple(m)
 
         jni_longname = JniLongName(*method_triple)
@@ -377,6 +377,21 @@ def compile_dex(apkfile, filtercfg, dynamic_register):
                 native_method_prototype[jni_longname] = code[1]
 
     return compiled_method_code, native_method_prototype, errors
+
+def compile_all_dex(apkfile, filtercfg, dynamic_register):
+    vms = auto_vms(apkfile)
+
+    compiled_method_code = {}
+    native_method_prototypes = {}
+    errors = []
+
+    for vm in vms:
+        codes, native_method_prototype, errors = compile_dex(vm, filtercfg, dynamic_register)
+        compiled_method_code.update(codes)
+        native_method_prototypes.update(native_method_prototype)
+        errors.extend(errors)
+
+    return compiled_method_code, native_method_prototypes, compile_error_msg
 
 def is_apk(name):
     return name.endswith('.apk')
@@ -450,7 +465,7 @@ def dcc_main(apkfile, filtercfg, outapk, do_compile=True, project_dir=None, sour
         logger.error("file %s is not exists", apkfile)
         return
 
-    compiled_methods, method_prototypes, errors = compile_dex(apkfile, filtercfg, dynamic_register)
+    compiled_methods, method_prototypes, errors = compile_all_dex(apkfile, filtercfg, dynamic_register)
 
     if errors:
         logger.warning('================================')
