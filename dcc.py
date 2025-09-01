@@ -378,7 +378,7 @@ def compile_dex(vm, filtercfg, dynamic_register):
 
     return compiled_method_code, native_method_prototype, errors
 
-def compile_all_dex(apkfile, filtercfg):
+def compile_all_dex(apkfile, filtercfg, dynamic_register):
     vms = auto_vms(apkfile)
 
     compiled_method_code = {}
@@ -386,7 +386,7 @@ def compile_all_dex(apkfile, filtercfg):
     errors = []
 
     for vm in vms:
-        codes, native_method_prototype, errors = compile_dex(vm, filtercfg)
+        codes, native_method_prototype, errors = compile_dex(vm, filtercfg, dynamic_register)
         compiled_method_code.update(codes)
         native_method_prototypes.update(native_method_prototype)
         errors.extend(errors)
