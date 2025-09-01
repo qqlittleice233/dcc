@@ -382,14 +382,16 @@ def compile_all_dex(apkfile, filtercfg):
     vms = auto_vms(apkfile)
 
     compiled_method_code = {}
-    compile_error_msg = []
+    native_method_prototypes = {}
+    errors = []
 
     for vm in vms:
-        codes, errors = compile_dex(vm, filtercfg)
+        codes, native_method_prototype, errors = compile_dex(vm, filtercfg)
         compiled_method_code.update(codes)
-        compile_error_msg.extend(errors)
+        native_method_prototypes.update(native_method_prototype)
+        errors.extend(errors)
 
-    return compiled_method_code, compile_error_msg
+    return compiled_method_code, native_method_prototypes, compile_error_msg
 
 def is_apk(name):
     return name.endswith('.apk')
