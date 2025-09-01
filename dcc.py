@@ -250,19 +250,40 @@ def copy_compiled_libs(project_dir, decompiled_dir):
 
 
 def native_class_methods(smali_path, compiled_methods):
-    def _skip_until(fp, needle):
+    def next_line():
+        return fp.readline()
+
+    def handle_annotanion():
         while True:
-            line = fp.readline()
+            line = next_line()
             if not line:
                 break
-            if line.strip() == needle:
+            s = line.strip()
+            code_lines.append(line)
+            if s == '.end annotation':
                 break
+            else:
+                continue
+
+    def handle_method_body():
+        while True:
+            line = next_line()
+            if not line:
+                break
+            s = line.strip()
+            if s == '.end method':
+                break
+            elif s.startswith('.annotation runtime') and s.find('Dex2C') < 0:
+                code_lines.append(line)
+                handle_annotanion()
+            else:
+                continue
 
     code_lines = []
     class_name = ''
     with open(smali_path, 'r') as fp:
         while True:
-            line = fp.readline()
+            line = next_line()
             if not line:
                 break
             code_lines.append(line)
@@ -274,8 +295,9 @@ def native_class_methods(smali_path, compiled_methods):
                 param = current_method.find('(')
                 name, proto = current_method[:param], current_method[param:]
                 if (class_name, name, proto) in compiled_methods:
-                    code_lines[-1] = code_lines[-1].replace(current_method, 'native ' + current_method)
-                    _skip_until(fp, '.end method')
+                    if line.find(' native ') < 0:
+                        code_lines[-1] = code_lines[-1].replace(current_method, 'native ' + current_method)
+                    handle_method_body()
                     code_lines.append('.end method\n')
 
     with open(smali_path, 'w') as fp:
@@ -309,7 +331,7 @@ def write_compiled_methods(project_dir, compiled_methods):
         if os.path.exists(filepath):
             logger.warning("Overwrite file %s %s" % (filepath, method_triple))
 
-        with open(filepath, 'w') as fp:
+        with open(filepath, 'w', encoding='utf-8') as fp:
             fp.write('#include "Dex2C.h"\n' + code)
 
     with open(os.path.join(source_dir, 'compiled_methods.txt'), 'w') as fp:
@@ -322,11 +344,12 @@ def archive_compiled_code(project_dir):
     return outfile
 
 
-def compile_dex(vm, filtercfg):
+def compile_dex(vm, filtercfg, dynamic_register):
     vmx = analysis.Analysis(vm)
     method_filter = MethodFilter(filtercfg, vm)
-    compiler = Dex2C(vm, vmx)
+    compiler = Dex2C(vm, vmx, dynamic_register)
 
+    native_method_prototype = {}
     compiled_method_code = {}
     errors = []
 
@@ -349,10 +372,11 @@ def compile_dex(vm, filtercfg):
                 errors.append('%s:%s' % (full_name, str(e)))
                 continue
 
-            if code:
-                compiled_method_code[method_triple] = code
+            if code[0]:
+                compiled_method_code[method_triple] = code[0]
+                native_method_prototype[jni_longname] = code[1]
 
-    return compiled_method_code, errors
+    return compiled_method_code, native_method_prototype, errors
 
 def compile_all_dex(apkfile, filtercfg):
     vms = auto_vms(apkfile)
@@ -370,12 +394,76 @@ def compile_all_dex(apkfile, filtercfg):
 def is_apk(name):
     return name.endswith('.apk')
 
-def dcc_main(apkfile, filtercfg, outapk, do_compile=True, project_dir=None, source_archive='project-source.zip'):
+def write_dummy_dynamic_register(project_dir):
+    source_dir = os.path.join(project_dir, 'jni', 'nc')
+    if not os.path.exists(source_dir):
+        os.makedirs(source_dir)
+
+    filepath = os.path.join(source_dir, 'DynamicRegister.cpp')
+    with open(filepath, 'w', encoding='utf-8') as fp:
+        fp.write('#include "DynamicRegister.h"\n\nconst char *dynamic_register_compile_methods(JNIEnv *env) { return nullptr; }')
+
+def write_dynamic_register(project_dir, compiled_methods, method_prototypes):
+    source_dir = os.path.join(project_dir, 'jni', 'nc')
+    if not os.path.exists(source_dir):
+        os.makedirs(source_dir)
+
+    export_list = {}
+
+    # Make export list
+    for method_triple in sorted(compiled_methods.keys()):
+        full_name = JniLongName(*method_triple)
+        if not full_name in method_prototypes:
+            raise Exception('Method %s prototype info could not be found' % full_name)
+
+        class_path = method_triple[0][1:-1].replace('.', '/')
+        method_name = method_triple[1]
+        method_signature = method_triple[2]
+        method_native_name = full_name
+        method_native_prototype = method_prototypes[full_name]
+
+        if not class_path in export_list:
+            export_list[class_path] = [] # methods
+        
+        export_list[class_path].append((method_name, method_signature, method_native_name, method_native_prototype))
+
+    if len(export_list) == 0:
+        logger.info('No export methods')
+        return
+    
+    # Generate extern block and export block
+    extern_block = []
+    export_block = ['\njclass clazz;\n']
+    export_block_template = 'clazz = env->FindClass("%s");\nif (clazz == nullptr)\n    return "Class not found: %s";\n'
+    export_block_template += 'const JNINativeMethod export_method_%d[] = {\n%s\n};\n'
+    export_block_template += 'env->RegisterNatives(clazz, export_method_%d, %d);\n'
+    export_block_template += 'env->DeleteLocalRef(clazz);\n'
+
+    for index, class_path in enumerate(sorted(export_list.keys())):
+        methods = export_list[class_path]
+
+        extern_block.append('\n'.join(['extern %s;' % method[3] for method in methods]))
+        
+        export_methods = ',\n'.join(['{"%s", "%s", (void *)%s}' % (method[0], method[1], method[2]) for method in methods])
+        export_block.append(export_block_template % (class_path, class_path, index, export_methods, index, len(methods)))
+
+    export_block.append('return nullptr;\n')
+
+    # Write DynamicRegister.cpp
+    filepath = os.path.join(source_dir, 'DynamicRegister.cpp')
+    with open(filepath, 'w', encoding='utf-8') as fp:
+        fp.write('#include "DynamicRegister.h"\n\n')
+        fp.write('\n'.join(extern_block))
+        fp.write('\n\nconst char *dynamic_register_compile_methods(JNIEnv *env) {')
+        fp.write('\n'.join(export_block))
+        fp.write('}')
+
+def dcc_main(apkfile, filtercfg, outapk, do_compile=True, project_dir=None, source_archive='project-source.zip', dynamic_register=False):
     if not os.path.exists(apkfile):
         logger.error("file %s is not exists", apkfile)
         return
 
-    compiled_methods, errors = compile_all_dex(apkfile, filtercfg)
+    compiled_methods, method_prototypes, errors = compile_all_dex(apkfile, filtercfg, dynamic_register)
 
     if errors:
         logger.warning('================================')
@@ -390,11 +478,22 @@ def dcc_main(apkfile, filtercfg, outapk, do_compile=True, project_dir=None, sour
         if not os.path.exists(project_dir):
             shutil.copytree('project', project_dir)
         write_compiled_methods(project_dir, compiled_methods)
+
+        if dynamic_register:
+            write_dynamic_register(project_dir, compiled_methods, method_prototypes)
+        else:
+            write_dummy_dynamic_register(project_dir)
     else:
         project_dir = make_temp_dir('dcc-project-')
         shutil.rmtree(project_dir)
         shutil.copytree('project', project_dir)
         write_compiled_methods(project_dir, compiled_methods)
+
+        if dynamic_register:
+            write_dynamic_register(project_dir, compiled_methods, method_prototypes)
+        else:
+            write_dummy_dynamic_register(project_dir)
+
         src_zip = archive_compiled_code(project_dir)
         shutil.move(src_zip, source_archive)
 
@@ -418,6 +517,7 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--out', nargs='?', help='Output APK file name')
     parser.add_argument('--sign', action='store_true', default=False, help='Sign apk')
     parser.add_argument('--filter', default='filter.txt', help='Method filter configure file')
+    parser.add_argument('--dynamic-register', action='store_true', default=False, help='Export native methods using RegisterNatives')
     parser.add_argument('--no-build', action='store_true', default=False, help='Do not build the compiled code')
     parser.add_argument('--source-dir', help='The compiled cpp code output directory.')
     parser.add_argument('--project-archive', default='project-source.zip', help='Archive the project directory')
@@ -429,6 +529,7 @@ if __name__ == '__main__':
     filtercfg = args['filter']
     do_compile = not args['no_build']
     source_archive = args['project_archive']
+    dynamic_register = args['dynamic_register']
 
     if args['source_dir']:
         project_dir = args['source_dir']
@@ -450,7 +551,7 @@ if __name__ == '__main__':
         APKTOOL = dcc_cfg['apktool']
 
     try:
-        dcc_main(infile, filtercfg, outapk, do_compile, project_dir, source_archive)
+        dcc_main(infile, filtercfg, outapk, do_compile, project_dir, source_archive, dynamic_register)
     except Exception as e:
         logger.error("Compile %s failed!" % infile, exc_info=True)
     finally:
