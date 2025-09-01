@@ -391,7 +391,7 @@ def compile_all_dex(apkfile, filtercfg, dynamic_register):
         native_method_prototypes.update(native_method_prototype)
         errors.extend(errors)
 
-    return compiled_method_code, native_method_prototypes, compile_error_msg
+    return compiled_method_code, native_method_prototypes, errors
 
 def is_apk(name):
     return name.endswith('.apk')
